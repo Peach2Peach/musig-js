@@ -13,6 +13,17 @@ export interface MuSig {
         msg?: Uint8Array;
         extraInput?: Uint8Array;
     }): Uint8Array;
+    nonceGenExtractable(args: {
+        sessionId?: Uint8Array;
+        secretKey?: Uint8Array;
+        publicKey: Uint8Array;
+        xOnlyPublicKey?: Uint8Array;
+        msg?: Uint8Array;
+        extraInput?: Uint8Array;
+    }): {
+        publicNonce: Uint8Array;
+        secretNonce: Uint8Array;
+    };
     addExternalNonce(publicNonce: Uint8Array, secretNonce: Uint8Array): void;
     nonceAgg(nonces: Uint8Array[]): Uint8Array;
     startSigningSession(aggNonce: Uint8Array, msg: Uint8Array, publicKeys: Uint8Array[], ...tweaks: Tweak[]): SessionKey;
