@@ -4,6 +4,8 @@ import { hashToPrivateScalar } from '@noble/curves/abstract/modular';
 import { numberToBytesBE } from '@noble/curves/abstract/utils';
 import { KeyGenContext, MuSigFactory, SessionKey } from '../index';
 import { nobleCrypto, tinyCrypto } from './utils';
+import * as tinyEcc from 'tiny-secp256k1';
+import { createCrypto } from '../adapters/secp256k1';
 import * as det_sign_vectors from './bip-vectors/det_sign_vectors.json';
 import * as key_sort_vectors from './bip-vectors/key_sort_vectors.json';
 import * as nonce_gen_vectors from './bip-vectors/nonce_gen_vectors.json';
@@ -61,6 +63,9 @@ const tweaks = new Array(5).fill(0).map((_, i) => {
 const cryptos = [
   { cryptoName: 'noble', crypto: nobleCrypto },
   { cryptoName: 'tiny', crypto: tinyCrypto },
+  // The shipped adapter (adapters/secp256k1) fed the same tiny-secp256k1 ecc —
+  // validates it against every test incl. the BIP327 vectors.
+  { cryptoName: 'adapter', crypto: createCrypto(tinyEcc) },
 ];
 
 for (const { cryptoName, crypto } of cryptos) {
@@ -313,6 +318,43 @@ for (const { cryptoName, crypto } of cryptos) {
               secretNonces.map((s) => Buffer.from(secp256k1.getPublicKey(s, true)))
             );
             expect(Buffer.from(publicNonce).toString('hex')).toBe(expectedNonce.toString('hex'));
+          });
+        }
+      );
+    });
+
+    describe('nonceGenExtractable', function () {
+      nonce_gen_vectors.test_cases.forEach(
+        ({ rand_, sk, pk, aggpk, msg, extra_in, expected }, index) => {
+          it(`returns the secret nonce matching BIP327 vector ${index}`, function () {
+            const args = {
+              sessionId: Buffer.from(rand_, 'hex'),
+              secretKey: sk === null ? undefined : Buffer.from(sk, 'hex'),
+              publicKey: Buffer.from(pk, 'hex'),
+              xOnlyPublicKey: aggpk === null ? undefined : Buffer.from(aggpk, 'hex'),
+              msg: msg === null ? undefined : Buffer.from(msg, 'hex'),
+              extraInput: extra_in === null ? undefined : Buffer.from(extra_in, 'hex'),
+            };
+            const { publicNonce, secretNonce } = musig.nonceGenExtractable(args);
+            // secret nonce layout: k1(32) || k2(32) || publicKey(33)
+            expect(secretNonce.length).toBe(97);
+            expect(Buffer.from(secretNonce.subarray(0, 64)).toString('hex')).toBe(
+              expected.substring(0, 128).toLowerCase()
+            );
+            expect(Buffer.from(secretNonce.subarray(64)).toString('hex')).toBe(pk.toLowerCase());
+            // publicNonce must equal what nonceGen produces for identical args
+            expect(Buffer.from(publicNonce).toString('hex')).toBe(
+              Buffer.from(musig.nonceGen(args)).toString('hex')
+            );
+            // public nonce halves must be k1*G and k2*G
+            const r1 = secp256k1.getPublicKey(secretNonce.subarray(0, 32), true);
+            const r2 = secp256k1.getPublicKey(secretNonce.subarray(32, 64), true);
+            expect(Buffer.from(publicNonce.subarray(0, 33)).toString('hex')).toBe(
+              Buffer.from(r1).toString('hex')
+            );
+            expect(Buffer.from(publicNonce.subarray(33)).toString('hex')).toBe(
+              Buffer.from(r2).toString('hex')
+            );
           });
         }
       );
@@ -680,3 +722,54 @@ for (const { cryptoName, crypto } of cryptos) {
     });
   });
 }
+
+describe('adversarial / safety properties', function () {
+  const musig = MuSigFactory(tinyCrypto);
+  const newKey = () => {
+    const sk = secp256k1.utils.randomPrivateKey();
+    return { sk, pk: Buffer.from(secp256k1.getPublicKey(sk, true)) };
+  };
+  function setup() {
+    const a = newKey();
+    const b = newKey();
+    const publicKeys = musig.keySort([a.pk, b.pk]);
+    const msg = nc.randomBytes(32);
+    const na = musig.nonceGenExtractable({ sessionId: nc.randomBytes(32), secretKey: a.sk, publicKey: a.pk, msg });
+    const nb = musig.nonceGenExtractable({ sessionId: nc.randomBytes(32), secretKey: b.sk, publicKey: b.pk, msg });
+    const aggNonce = musig.nonceAgg([na.publicNonce, nb.publicNonce]);
+    const session = musig.startSigningSession(aggNonce, msg, publicKeys);
+    return { a, b, na, nb, session };
+  }
+
+  it('enforces single-use nonces: signing twice with the same nonce throws', function () {
+    const { a, na, session } = setup();
+    musig.partialSign({ secretKey: a.sk, publicNonce: na.publicNonce, sessionKey: session });
+    expect(() =>
+      musig.partialSign({ secretKey: a.sk, publicNonce: na.publicNonce, sessionKey: session })
+    ).toThrow(/No secret nonce/);
+  });
+
+  it('rejects a tampered partial signature', function () {
+    const { a, na, session } = setup();
+    const sig = musig.partialSign({ secretKey: a.sk, publicNonce: na.publicNonce, sessionKey: session, verify: false });
+    const tampered = Uint8Array.from(sig);
+    tampered[0] ^= 0x01;
+    expect(musig.partialVerify({ sig: tampered, publicKey: a.pk, publicNonce: na.publicNonce, sessionKey: session })).toBe(false);
+  });
+
+  it('rejects a partial signature checked against the wrong signer', function () {
+    const { a, b, na, nb, session } = setup();
+    const sigA = musig.partialSign({ secretKey: a.sk, publicNonce: na.publicNonce, sessionKey: session, verify: false });
+    expect(musig.partialVerify({ sig: sigA, publicKey: a.pk, publicNonce: na.publicNonce, sessionKey: session })).toBe(true);
+    expect(musig.partialVerify({ sig: sigA, publicKey: b.pk, publicNonce: nb.publicNonce, sessionKey: session })).toBe(false);
+  });
+
+  it('is rogue-key resistant: aggregate key applies coefficients (≠ naive point sum)', function () {
+    const a = newKey();
+    const b = newKey();
+    const ctx = musig.keyAgg(musig.keySort([a.pk, b.pk]));
+    const agg = musig.getPlainPubkey(ctx);
+    const naiveSum = tinyCrypto.pointAdd(a.pk, b.pk, true);
+    expect(Buffer.from(agg).toString('hex')).not.toBe(Buffer.from(naiveSum!).toString('hex'));
+  });
+});

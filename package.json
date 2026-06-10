@@ -79,15 +79,26 @@
     "./base_crypto": {
       "import": "./lib/esm/base_crypto.js",
       "default": "./lib/base_crypto.js"
+    },
+    "./adapters/secp256k1": {
+      "types": "./lib/adapters/secp256k1.d.ts",
+      "import": "./lib/esm/adapters/secp256k1.js",
+      "default": "./lib/adapters/secp256k1.js"
     }
   },
   "jest": {
     "testRegex": "/test/(?!utils|benchmark).*?\\.ts",
+    "moduleNameMapper": {
+      "^(\\.{1,2}/.*)\\.js$": "$1"
+    },
     "transform": {
       "^.+\\.ts$": "ts-jest"
     },
     "collectCoverageFrom": [
       "*.ts"
     ]
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.3.0"
   }
 }

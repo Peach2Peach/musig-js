@@ -2,7 +2,9 @@
   "compilerOptions": {
     "strict": true,
     "target": "es2020",
-    "lib": ["es2020"],
+    "lib": [
+      "es2020"
+    ],
     "module": "commonjs",
     "moduleResolution": "node",
     "outDir": "lib",
@@ -13,6 +15,13 @@
     "esModuleInterop": true,
     "baseUrl": "."
   },
-  "include": ["index.ts", "base_crypto.ts"],
-  "exclude": ["node_modules", "lib"]
+  "include": [
+    "index.ts",
+    "base_crypto.ts",
+    "adapters/secp256k1.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "lib"
+  ]
 }

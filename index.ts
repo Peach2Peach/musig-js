@@ -81,6 +81,20 @@ export interface MuSig {
   }): Uint8Array;
 
   /**
+   * Like nonceGen, but also returns the 97-byte secret nonce so the caller can
+   * persist it (e.g. a server storing it between signing rounds) instead of
+   * relying on the internal cache. Treat the secret nonce like a private key.
+   */
+  nonceGenExtractable(args: {
+    sessionId?: Uint8Array;
+    secretKey?: Uint8Array;
+    publicKey: Uint8Array;
+    xOnlyPublicKey?: Uint8Array;
+    msg?: Uint8Array;
+    extraInput?: Uint8Array;
+  }): { publicNonce: Uint8Array; secretNonce: Uint8Array };
+
+  /**
    * Add an externally generated nonce to the cache.
    *
    * NOT RECOMMENDED, but useful in testing at least.
@@ -907,6 +921,79 @@ export function MuSigFactory(ecc: Crypto): MuSig {
     }
   }
 
+  // Shared nonce derivation (BIP327 NonceGen). Returns both the public nonce and
+  // the secret nonce so callers can either cache it internally (nonceGen) or take
+  // ownership of the secret to persist it themselves (nonceGenExtractable).
+  function computeNonce({
+    sessionId = makeSessionId(),
+    secretKey,
+    publicKey,
+    xOnlyPublicKey,
+    msg,
+    extraInput,
+  }: {
+    sessionId?: Uint8Array;
+    secretKey?: Uint8Array;
+    publicKey: Uint8Array;
+    xOnlyPublicKey?: Uint8Array;
+    msg?: Uint8Array;
+    extraInput?: Uint8Array;
+  }): { publicNonce: Uint8Array; secretNonce: Uint8Array } {
+    if (extraInput !== undefined && extraInput.length > Math.pow(2, 32) - 1)
+      throw new TypeError('extraInput is limited to 2^32-1 bytes');
+    // No need to check msg, its max size is larger than JS typed array limit
+    checkArgs({ sessionId, secretKey, publicKey, xOnlyPublicKey });
+    let rand: Uint8Array;
+    if (secretKey !== undefined) {
+      rand = ecc.taggedHash(TAGS.musig_aux, sessionId);
+      for (let i = 0; i < 32; i++) {
+        rand[i] = rand[i] ^ secretKey[i];
+      }
+    } else {
+      rand = sessionId;
+    }
+
+    if (xOnlyPublicKey === undefined) xOnlyPublicKey = new Uint8Array();
+
+    const mPrefixed = [Uint8Array.of(0)];
+    if (msg !== undefined) {
+      mPrefixed[0][0] = 1;
+      mPrefixed.push(new Uint8Array(8));
+      new DataView(mPrefixed[1].buffer).setBigUint64(0, BigInt(msg.length));
+      mPrefixed.push(msg);
+    }
+
+    if (extraInput === undefined) extraInput = new Uint8Array();
+    const eLength = new Uint8Array(4);
+    new DataView(eLength.buffer).setUint32(0, extraInput.length);
+
+    const secretNonce = new Uint8Array(97);
+    const publicNonce = new Uint8Array(66);
+    for (let i = 0; i < 2; i++) {
+      const kH = ecc.taggedHash(
+        TAGS.musig_nonce,
+        rand,
+        Uint8Array.of(publicKey.length),
+        publicKey,
+        Uint8Array.of(xOnlyPublicKey.length),
+        xOnlyPublicKey,
+        ...mPrefixed,
+        eLength,
+        extraInput,
+        Uint8Array.of(i)
+      );
+      const k = ecc.scalarMod(kH);
+      if (compare32b(SCALAR_0, k) === 0) throw new Error('0 secret nonce');
+      const pub = ecc.getPublicKey(k, true);
+      if (pub === null) throw new Error('Secret nonce has no corresponding public nonce');
+
+      secretNonce.set(k, i * 32);
+      publicNonce.set(pub, i * 33);
+    }
+    secretNonce.set(publicKey, 64);
+    return { publicNonce, secretNonce };
+  }
+
   return {
     getXOnlyPubkey: (ctx: KeyGenContext | SessionKey): Uint8Array => {
       if ('aggPublicKey' in ctx) return ecc.pointX(ctx.aggPublicKey);
@@ -927,75 +1014,36 @@ export function MuSigFactory(ecc: Crypto): MuSig {
       return tweaks.reduce((c, tweak) => addTweak(c, tweak), ctx);
     },
 
-    nonceGen: ({
-      sessionId = makeSessionId(),
-      secretKey,
-      publicKey,
-      xOnlyPublicKey,
-      msg,
-      extraInput,
-    }: {
-      sessionId: Uint8Array;
+    nonceGen: (args: {
+      sessionId?: Uint8Array;
       secretKey?: Uint8Array;
       publicKey: Uint8Array;
       xOnlyPublicKey?: Uint8Array;
       msg?: Uint8Array;
       extraInput?: Uint8Array;
     }): Uint8Array => {
-      if (extraInput !== undefined && extraInput.length > Math.pow(2, 32) - 1)
-        throw new TypeError('extraInput is limited to 2^32-1 bytes');
-      // No need to check msg, its max size is larger than JS typed array limit
-      checkArgs({ sessionId, secretKey, publicKey, xOnlyPublicKey });
-      let rand: Uint8Array;
-      if (secretKey !== undefined) {
-        rand = ecc.taggedHash(TAGS.musig_aux, sessionId);
-        for (let i = 0; i < 32; i++) {
-          rand[i] = rand[i] ^ secretKey[i];
-        }
-      } else {
-        rand = sessionId;
-      }
-
-      if (xOnlyPublicKey === undefined) xOnlyPublicKey = new Uint8Array();
-
-      const mPrefixed = [Uint8Array.of(0)];
-      if (msg !== undefined) {
-        mPrefixed[0][0] = 1;
-        mPrefixed.push(new Uint8Array(8));
-        new DataView(mPrefixed[1].buffer).setBigUint64(0, BigInt(msg.length));
-        mPrefixed.push(msg);
-      }
-
-      if (extraInput === undefined) extraInput = new Uint8Array();
-      const eLength = new Uint8Array(4);
-      new DataView(eLength.buffer).setUint32(0, extraInput.length);
-
-      const secretNonce = new Uint8Array(97);
-      const publicNonce = new Uint8Array(66);
-      for (let i = 0; i < 2; i++) {
-        const kH = ecc.taggedHash(
-          TAGS.musig_nonce,
-          rand,
-          Uint8Array.of(publicKey.length),
-          publicKey,
-          Uint8Array.of(xOnlyPublicKey.length),
-          xOnlyPublicKey,
-          ...mPrefixed,
-          eLength,
-          extraInput,
-          Uint8Array.of(i)
-        );
-        const k = ecc.scalarMod(kH);
-        if (compare32b(SCALAR_0, k) === 0) throw new Error('0 secret nonce');
-        const pub = ecc.getPublicKey(k, true);
-        if (pub === null) throw new Error('Secret nonce has no corresponding public nonce');
-
-        secretNonce.set(k, i * 32);
-        publicNonce.set(pub, i * 33);
-      }
-      secretNonce.set(publicKey, 64);
+      const { publicNonce, secretNonce } = computeNonce(args);
       _nonceCache.set(publicNonce, secretNonce);
       return publicNonce;
+    },
+
+    // Same as nonceGen, but returns the secret nonce too so the caller can own
+    // its lifecycle (e.g. persist it in a DB between signing rounds) rather than
+    // relying on the internal cache. It is still cached, so partialSign works
+    // either with the returned publicNonce in-process or after addExternalNonce.
+    // SECURITY: the secret nonce is as sensitive as a private key — store it
+    // encrypted, use it exactly once, and never reuse it across signing sessions.
+    nonceGenExtractable: (args: {
+      sessionId?: Uint8Array;
+      secretKey?: Uint8Array;
+      publicKey: Uint8Array;
+      xOnlyPublicKey?: Uint8Array;
+      msg?: Uint8Array;
+      extraInput?: Uint8Array;
+    }): { publicNonce: Uint8Array; secretNonce: Uint8Array } => {
+      const { publicNonce, secretNonce } = computeNonce(args);
+      _nonceCache.set(publicNonce, secretNonce);
+      return { publicNonce, secretNonce };
     },
 
     addExternalNonce: (publicNonce: Uint8Array, secretNonce: Uint8Array): void => {
