@@ -14,7 +14,7 @@
     "lint": "tslint -p tsconfig.json -c tslint.json",
     "format": "npm run prettier -- --write",
     "format:ci": "npm run prettier -- --check && npm run prettierout -- --check",
-    "prettier": "prettier --print-width 100 --single-quote \"*.ts\" \"test/**/*.ts\"",
+    "prettier": "prettier --print-width 100 --single-quote \"*.ts\" \"adapters/**/*.ts\" \"test/**/*.ts\"",
     "prettierout": "prettier --print-width 100 --single-quote \"lib/**/*.js\"",
     "test": "npm run prettier -- --check && npm run lint && npm run build && npm run coverage",
     "nobuild:test": "jest",
@@ -95,8 +95,17 @@
       "^.+\\.ts$": "ts-jest"
     },
     "collectCoverageFrom": [
-      "*.ts"
-    ]
+      "*.ts",
+      "adapters/**/*.ts"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "statements": 92,
+        "branches": 78,
+        "functions": 95,
+        "lines": 95
+      }
+    }
   },
   "dependencies": {
     "@noble/hashes": "^1.3.0"

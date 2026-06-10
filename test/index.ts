@@ -734,8 +734,18 @@ describe('adversarial / safety properties', function () {
     const b = newKey();
     const publicKeys = musig.keySort([a.pk, b.pk]);
     const msg = nc.randomBytes(32);
-    const na = musig.nonceGenExtractable({ sessionId: nc.randomBytes(32), secretKey: a.sk, publicKey: a.pk, msg });
-    const nb = musig.nonceGenExtractable({ sessionId: nc.randomBytes(32), secretKey: b.sk, publicKey: b.pk, msg });
+    const na = musig.nonceGenExtractable({
+      sessionId: nc.randomBytes(32),
+      secretKey: a.sk,
+      publicKey: a.pk,
+      msg,
+    });
+    const nb = musig.nonceGenExtractable({
+      sessionId: nc.randomBytes(32),
+      secretKey: b.sk,
+      publicKey: b.pk,
+      msg,
+    });
     const aggNonce = musig.nonceAgg([na.publicNonce, nb.publicNonce]);
     const session = musig.startSigningSession(aggNonce, msg, publicKeys);
     return { a, b, na, nb, session };
@@ -751,17 +761,48 @@ describe('adversarial / safety properties', function () {
 
   it('rejects a tampered partial signature', function () {
     const { a, na, session } = setup();
-    const sig = musig.partialSign({ secretKey: a.sk, publicNonce: na.publicNonce, sessionKey: session, verify: false });
+    const sig = musig.partialSign({
+      secretKey: a.sk,
+      publicNonce: na.publicNonce,
+      sessionKey: session,
+      verify: false,
+    });
     const tampered = Uint8Array.from(sig);
     tampered[0] ^= 0x01;
-    expect(musig.partialVerify({ sig: tampered, publicKey: a.pk, publicNonce: na.publicNonce, sessionKey: session })).toBe(false);
+    expect(
+      musig.partialVerify({
+        sig: tampered,
+        publicKey: a.pk,
+        publicNonce: na.publicNonce,
+        sessionKey: session,
+      })
+    ).toBe(false);
   });
 
   it('rejects a partial signature checked against the wrong signer', function () {
     const { a, b, na, nb, session } = setup();
-    const sigA = musig.partialSign({ secretKey: a.sk, publicNonce: na.publicNonce, sessionKey: session, verify: false });
-    expect(musig.partialVerify({ sig: sigA, publicKey: a.pk, publicNonce: na.publicNonce, sessionKey: session })).toBe(true);
-    expect(musig.partialVerify({ sig: sigA, publicKey: b.pk, publicNonce: nb.publicNonce, sessionKey: session })).toBe(false);
+    const sigA = musig.partialSign({
+      secretKey: a.sk,
+      publicNonce: na.publicNonce,
+      sessionKey: session,
+      verify: false,
+    });
+    expect(
+      musig.partialVerify({
+        sig: sigA,
+        publicKey: a.pk,
+        publicNonce: na.publicNonce,
+        sessionKey: session,
+      })
+    ).toBe(true);
+    expect(
+      musig.partialVerify({
+        sig: sigA,
+        publicKey: b.pk,
+        publicNonce: nb.publicNonce,
+        sessionKey: session,
+      })
+    ).toBe(false);
   });
 
   it('is rogue-key resistant: aggregate key applies coefficients (≠ naive point sum)', function () {
