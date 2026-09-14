@@ -101,4 +101,10 @@ export interface SessionKey {
     aggNonce: Uint8Array;
     msg: Uint8Array;
 }
+export type Contribution = 'pubkey' | 'pubnonce' | 'aggnonce' | 'aggothernonce' | 'psig';
+export declare class InvalidContributionError extends Error {
+    readonly signer: number | null;
+    readonly contrib: Contribution;
+    constructor(signer: number | null, contrib: Contribution);
+}
 export declare function MuSigFactory(ecc: Crypto): MuSig;

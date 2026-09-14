@@ -31,9 +31,13 @@ export interface MuSig {
    * Performs MuSig key aggregation on 1+ x-only public keys.
    *
    * @param publicKeys array of compressed DER encoded public keys to aggregate
-   * @param tweaks tweaks (0 < tweak < n) to apply to the aggregate key,
+   * @param tweaks tweaks (0 <= tweak < n) to apply to the aggregate key,
    * and optionally booleans to indicate x-only tweaking
    * @returns an opaque key gen context for use with other MuSig operations
+   * @throws InvalidContributionError (signer i, 'pubkey') if public key i is
+   * not a valid compressed point
+   * @throws Error if a tweak is not 32 bytes, is not less than n, or tweaking
+   * results in the point at infinity
    */
   keyAgg(publicKeys: Uint8Array[], ...tweaks: Tweak[]): KeyGenContext;
 
@@ -41,9 +45,11 @@ export interface MuSig {
    * Apply one or more x-only or ordinary tweaks to an aggregate public key.
    *
    * @param ctx the key generation context, as returned from `keyAgg`.
-   * @param tweaks tweaks (0 < tweak < n) to apply to the aggregate key,
+   * @param tweaks tweaks (0 <= tweak < n) to apply to the aggregate key,
    * and optionally booleans to indicate x-only tweaking
    * @returns an opaque key gen context for use with other MuSig operations
+   * @throws Error if a tweak is not 32 bytes, is not less than n, or tweaking
+   * results in the point at infinity
    */
   addTweaks(ctx: KeyGenContext, ...tweaks: Tweak[]): KeyGenContext;
 
@@ -98,6 +104,8 @@ export interface MuSig {
    * Add an externally generated nonce to the cache.
    *
    * NOT RECOMMENDED, but useful in testing at least.
+   * Throws if either secret nonce value is out of range, or if the secret
+   * nonce does not produce `publicNonce`.
    * @param publicNonce 66-byte public nonce (2 points in compressed DER)
    * @param secretNonce 97-byte secret nonce (2 32-byte scalars, and the public
    * key which will sign for this nonce in compressed DER)
@@ -116,6 +124,8 @@ export interface MuSig {
    *
    * @param nonces n-signers public nonces (66-bytes each)
    * @return the aggregate public nonce (66-bytes)
+   * @throws InvalidContributionError (signer i, 'pubnonce') if nonce i is not
+   * two valid compressed points
    */
   nonceAgg(nonces: Uint8Array[]): Uint8Array;
 
@@ -125,11 +135,14 @@ export interface MuSig {
    * participant, but may not be provided by an untrusted party.
    *
    * @param aggNonce this signing session's aggregate nonce
-   * @param msg the 32-byte message to sign for, most commonly a transaction hash.
+   * @param msg the message to sign, of any length (most commonly a 32-byte
+   * transaction hash)
    * @param publicKeys array of compressed DER encoded public keys to aggregate
-   * @param tweaks tweaks (0 < tweak < n) to apply to the aggregate key,
+   * @param tweaks tweaks (0 <= tweak < n) to apply to the aggregate key,
    * and optionally booleans to indicate x-only tweaking
    * @return session key for `partialSign`, `partialVerify` and `signAgg`
+   * @throws as `keyAgg`, then InvalidContributionError (null, 'aggnonce') if
+   * the aggregate nonce is invalid
    */
   startSigningSession(
     aggNonce: Uint8Array,
@@ -153,6 +166,9 @@ export interface MuSig {
    * @param sessionKey signing session key (from startSigningSession)
    * @param verify if false, don't verify partial signature
    * @return resulting signature
+   * @throws Error, with the BIP327 message, if a secret nonce value or the
+   * secret key is out of range, the secret key does not match the nonce, or
+   * the signer's public key is not one of the session's public keys
    */
   partialSign(args: {
     secretKey: Uint8Array;
@@ -165,12 +181,14 @@ export interface MuSig {
    * Verifies a MuSig partial signature for the given values.
    *
    * @param sig the 32-byte MuSig partial signature to verify
-   * @param msg the 32-byte message to sign for, most commonly a transaction hash
    * @param publicKey signer's public key
    * @param publicNonce signer's public nonce
-   * @param aggNonce this signing session's aggregate nonce
    * @param sessionKey signing session key (from startSigningSession)
-   * @return true if the partial signature is valid, otherwise false
+   * @return true if the partial signature is valid, otherwise false (including
+   * when the signature is not less than n)
+   * @throws Error if `publicKey` is not one of the session's public keys
+   * @throws InvalidContributionError (the signer's index, 'pubnonce') if the
+   * public nonce is invalid
    */
   partialVerify(args: {
     sig: Uint8Array;
@@ -185,6 +203,8 @@ export interface MuSig {
    * @param sigs array of 32-bytes MuSig partial signatures.
    * @param sessionKey signing session key (from startSigningSession)
    * @return the resulting aggregate signature.
+   * @throws InvalidContributionError (signer i, 'psig') if partial signature i
+   * is not a 32-byte value less than n
    */
   signAgg(sigs: Uint8Array[], sessionKey: SessionKey): Uint8Array;
 
@@ -204,6 +224,10 @@ export interface MuSig {
    * @param verify if false, don't verify partial signature
    * @return resulting signature, session key (for signature aggregation), and
    * public nonce (for partial verification)
+   * @throws as `keyAgg`; Error if the secret key is out of range or its public
+   * key is not in `publicKeys`; InvalidContributionError (null,
+   * 'aggothernonce') if `aggOtherNonce` is invalid. All of these are checked
+   * before any nonce is derived.
    */
   deterministicSign(args: {
     secretKey: Uint8Array;
@@ -458,6 +482,31 @@ export interface SessionKey {
   msg: Uint8Array;
 }
 
+/** Which value a participant contributed that was invalid. */
+export type Contribution = 'pubkey' | 'pubnonce' | 'aggnonce' | 'aggothernonce' | 'psig';
+
+/**
+ * A participant contributed an invalid value: BIP327's InvalidContributionError.
+ * Callers should hold the offending party accountable rather than crash.
+ *
+ * `signer` is the index of the offending signer in the list of public keys,
+ * nonces or partial signatures, or null when the value came from the nonce
+ * aggregator (`aggnonce`) or combines several signers (`aggothernonce`).
+ */
+export class InvalidContributionError extends Error {
+  readonly signer: number | null;
+  readonly contrib: Contribution;
+
+  constructor(signer: number | null, contrib: Contribution) {
+    super(signer === null ? `Invalid ${contrib}` : `Invalid ${contrib} from signer ${signer}`);
+    this.name = 'InvalidContributionError';
+    this.signer = signer;
+    this.contrib = contrib;
+    // Keeps `instanceof` working when compiled to ES5.
+    Object.setPrototypeOf(this, InvalidContributionError.prototype);
+  }
+}
+
 const TAGS = {
   challenge: 'BIP0340/challenge',
   keyagg_list: 'KeyAgg list',
@@ -557,8 +606,9 @@ export function MuSigFactory(ecc: Crypto): MuSig {
 
   function addTweak(ctx: KeyGenContext, t: Tweak): KeyGenContext {
     const tweak = 'tweak' in t ? t : { tweak: t };
-    if (!ecc.isScalar(tweak.tweak))
-      throw new TypeError('Expected tweak to be a valid scalar with curve order');
+    // Messages as in BIP327 ApplyTweak.
+    if (tweak.tweak.length !== 32) throw new Error('The tweak must be a 32-byte array.');
+    if (!ecc.isScalar(tweak.tweak)) throw new Error('The tweak must be less than n.');
     let { gacc, tacc } = ctx;
     let aggPublicKey: Uint8Array | null = ctx.aggPublicKey;
 
@@ -568,15 +618,18 @@ export function MuSigFactory(ecc: Crypto): MuSig {
       tacc = ecc.scalarNegate(tacc); // g * tacc mod n
       aggPublicKey = ecc.pointNegate(aggPublicKey); // g * Q
     }
-    aggPublicKey = ecc.pointAddTweak(aggPublicKey, tweak.tweak, false); // g * Q + t * G
-    if (aggPublicKey === null) throw new Error('Unexpected point at infinity during tweaking');
+    // A zero tweak leaves g * Q as it is, and not every backend accepts a zero scalar.
+    if (compare32b(tweak.tweak, SCALAR_0) !== 0) {
+      aggPublicKey = ecc.pointAddTweak(aggPublicKey, tweak.tweak, false); // g * Q + t * G
+      if (aggPublicKey === null) throw new Error('The result of tweaking cannot be infinity.');
+    }
     tacc = ecc.scalarAdd(tweak.tweak, tacc); // t + g * tacc mod n
 
     return { aggPublicKey, gacc, tacc };
   }
 
   function keyAgg(publicKeys: Uint8Array[], ...tweaks: Tweak[]): KeyGenContext {
-    checkArgs({ publicKeys });
+    checkPublicKeys(publicKeys);
     const multipliedPublicKeys = publicKeys.map((publicKey) => {
       const coefficient = keyAggCoeff(publicKeys, publicKey);
       let multipliedPublicKey: Uint8Array | null;
@@ -608,22 +661,83 @@ export function MuSigFactory(ecc: Crypto): MuSig {
     return sessionValues;
   }
 
-  function nonceAgg(publicNonces: Uint8Array[]): Uint8Array {
-    checkArgs({ publicNonces });
+  // Validity is checked explicitly with the bundled curve equation (`isPoint`),
+  // rather than left to whichever point-math backend is injected.
+  function isCompressedPoint(p: Uint8Array): boolean {
+    return p.length === 33 && (p[0] === 2 || p[0] === 3) && ecc.isPoint(p);
+  }
 
-    const aggNonces: Array<Uint8Array | null> = [
-      publicNonces[0].subarray(0, 33),
-      publicNonces[0].subarray(33),
-    ];
-    for (let i = 1; i < publicNonces.length; i++) {
-      if (aggNonces[0] !== null)
-        aggNonces[0] = ecc.pointAdd(aggNonces[0], publicNonces[i].subarray(0, 33), false);
-      if (aggNonces[1] !== null)
-        aggNonces[1] = ecc.pointAdd(aggNonces[1], publicNonces[i].subarray(33), false);
-    }
+  // BIP327 KeyAgg: a key that is not a valid compressed point is the fault of
+  // the signer who supplied it.
+  function checkPublicKeys(publicKeys: Uint8Array[]): void {
+    if (publicKeys.length === 0) throw new TypeError('0-length publicKeys not supported');
+    publicKeys.forEach((publicKey, i) => {
+      if (!isCompressedPoint(publicKey)) throw new InvalidContributionError(i, 'pubkey');
+    });
+  }
+
+  // BIP327 Sign / DeterministicSign / PartialSigVerify: the signer's key must be
+  // one of the keys being aggregated. Without this check a signer can be induced
+  // to produce a partial signature for a key set it is not part of. Returns the
+  // signer's index.
+  function assertSignerIncluded(publicKey: Uint8Array, publicKeys: Uint8Array[]): number {
+    const index = publicKeys.findIndex((key) => compare33b(key, publicKey) === 0);
+    if (index === -1)
+      throw new Error("The signer's pubkey must be included in the list of pubkeys.");
+    return index;
+  }
+
+  // A public nonce is two valid compressed points. Neither may be infinity.
+  function isValidPubNonce(publicNonce: Uint8Array): boolean {
+    return (
+      publicNonce.length === 66 &&
+      isCompressedPoint(publicNonce.subarray(0, 33)) &&
+      isCompressedPoint(publicNonce.subarray(33))
+    );
+  }
+
+  // An aggregate nonce may encode either point as infinity: 33 zero bytes.
+  function isValidAggNonce(aggNonce: Uint8Array): boolean {
+    if (aggNonce.length !== 66) return false;
+    return [aggNonce.subarray(0, 33), aggNonce.subarray(33)].every(
+      (half) => compare33b(half, CPOINT_INF) === 0 || isCompressedPoint(half)
+    );
+  }
+
+  function checkSecretKey(secretKey: Uint8Array, rangeMessage: string): void {
+    if (secretKey.length !== 32)
+      throw new TypeError(`Invalid secretKey length (${secretKey.length})`);
+    if (!ecc.isSecret(secretKey)) throw new Error(rangeMessage);
+  }
+
+  // Messages as in BIP327 Sign.
+  function checkSecretNonce(secretNonce: Uint8Array): void {
+    if (secretNonce.length !== 97)
+      throw new TypeError(`Invalid secretNonce length (${secretNonce.length})`);
+    if (!ecc.isSecret(secretNonce.subarray(0, 32)))
+      throw new Error('first secnonce value is out of range.');
+    if (!ecc.isSecret(secretNonce.subarray(32, 64)))
+      throw new Error('second secnonce value is out of range.');
+  }
+
+  function nonceAgg(publicNonces: Uint8Array[]): Uint8Array {
+    if (publicNonces.length === 0) throw new TypeError('0-length publicNonces not supported');
+    publicNonces.forEach((publicNonce, i) => {
+      if (!isValidPubNonce(publicNonce)) throw new InvalidContributionError(i, 'pubnonce');
+    });
+
+    // Each half is summed separately. `null` is the point at infinity, which a
+    // running sum can pass through (R, then -R) before later nonces are added.
     const aggNonce = new Uint8Array(66);
-    if (aggNonces[0] !== null) aggNonce.set(ecc.pointCompress(aggNonces[0]), 0);
-    if (aggNonces[1] !== null) aggNonce.set(ecc.pointCompress(aggNonces[1]), 33);
+    for (let half = 0; half < 2; half++) {
+      let sum: Uint8Array | null = null;
+      for (const publicNonce of publicNonces) {
+        const point = publicNonce.subarray(half * 33, (half + 1) * 33);
+        sum = sum === null ? point : ecc.pointAdd(sum, point, false);
+      }
+      // A total at infinity stays encoded as 33 zero bytes.
+      if (sum !== null) aggNonce.set(ecc.pointCompress(sum, true), half * 33);
+    }
     return aggNonce;
   }
 
@@ -741,17 +855,25 @@ export function MuSigFactory(ecc: Crypto): MuSig {
     sessionKey: SessionKey;
     verify: boolean;
   }): Uint8Array {
-    checkArgs({ publicNonce, secretKey });
+    if (publicNonce.length !== 66)
+      throw new TypeError(`Invalid publicNonce length (${publicNonce.length})`);
+    const { publicKeys } = getSessionValues(sessionKey);
 
+    // Removed before anything else can fail, so a failed attempt can never be
+    // retried with the same nonce.
     const secretNonce = _nonceCache.get(publicNonce);
     if (secretNonce === undefined)
       throw new Error('No secret nonce found for specified public nonce');
     _nonceCache.delete(publicNonce);
 
+    // Checked in the order of BIP327 Sign, with its messages.
+    checkSecretNonce(secretNonce);
+    checkSecretKey(secretKey, 'secret key value is out of range.');
     const publicKey = ecc.getPublicKey(secretKey, true);
-    if (publicKey === null) throw new Error('Invalid secret key, no corresponding public key');
+    if (publicKey === null) throw new Error('secret key value is out of range.');
     if (compare33b(publicKey, secretNonce.subarray(64)) !== 0)
-      throw new Error('Secret nonce pubkey mismatch');
+      throw new Error('Public key does not match nonce_gen argument');
+    assertSignerIncluded(publicKey, publicKeys);
     const secretNonces: [Uint8Array, Uint8Array] = [
       secretNonce.subarray(0, 32),
       secretNonce.subarray(32, 64),
@@ -818,9 +940,17 @@ export function MuSigFactory(ecc: Crypto): MuSig {
     publicNonce: Uint8Array;
   } {
     // No need to check msg, its max size is larger than JS typed array limit
-    checkArgs({ rand, secretKey, aggOtherNonce });
+    checkArgs({ rand });
+    const secretKeyRange = 'The secret key must be an integer in the range 1..n-1.';
+    checkSecretKey(secretKey, secretKeyRange);
     const publicKey = ecc.getPublicKey(secretKey, true);
-    if (publicKey === null) throw new Error('Secret key has no corresponding public key');
+    if (publicKey === null) throw new Error(secretKeyRange);
+
+    // Everything is validated before any nonce is derived, so nonce-only calls
+    // refuse too. Invalid keys and tweaks are reported first, as in BIP327.
+    const ctx = keyAgg(publicKeys, ...tweaks);
+    assertSignerIncluded(publicKey, publicKeys);
+    if (!isValidPubNonce(aggOtherNonce)) throw new InvalidContributionError(null, 'aggothernonce');
 
     let secretKeyPrime;
     if (rand !== undefined) {
@@ -831,7 +961,6 @@ export function MuSigFactory(ecc: Crypto): MuSig {
     } else {
       secretKeyPrime = secretKey;
     }
-    const ctx = keyAgg(publicKeys, ...tweaks);
     const aggPublicKey = ecc.pointX(ctx.aggPublicKey);
 
     const mLength = new Uint8Array(8);
@@ -869,7 +998,8 @@ export function MuSigFactory(ecc: Crypto): MuSig {
     return { sig, sessionKey, publicNonce };
   }
 
-  // TODO: Improve arg checking now that we have startSigningSession
+  // Structural (length and scalar range) checks. Point validity is checked where
+  // keys and nonces are used: checkPublicKeys, isValidPubNonce, isValidAggNonce.
   const pubKeyArgs = ['publicKey', 'publicKeys'] as const;
   const scalarArgs = ['tweak', 'sig', 'sigs', 'tacc', 'gacc'] as const;
   const otherArgs32b = ['xOnlyPublicKey', 'rand', 'sessionId'] as const;
@@ -881,7 +1011,7 @@ export function MuSigFactory(ecc: Crypto): MuSig {
     'aggOtherNonce',
     'finalNonce',
   ] as const;
-  const otherArgs = ['aggPublicKey', 'secretNonce'] as const;
+  const otherArgs = ['aggPublicKey'] as const;
   type ArgName =
     | (typeof pubKeyArgs)[number]
     | (typeof args32b)[number]
@@ -893,7 +1023,6 @@ export function MuSigFactory(ecc: Crypto): MuSig {
   args32b.forEach((a) => argLengths.set(a, 32));
   pubKeyArgs.forEach((a) => argLengths.set(a, 33));
   pubNonceArgs.forEach((a) => argLengths.set(a, 66));
-  argLengths.set('secretNonce', 97);
   argLengths.set('aggPublicKey', 65);
   const scalarNames = new Set<string>();
   scalarArgs.forEach((n) => scalarNames.add(n));
@@ -908,15 +1037,10 @@ export function MuSigFactory(ecc: Crypto): MuSig {
           throw new TypeError(`Invalid ${name} length (${value.length})`);
         if (name === 'secretKey') {
           if (!ecc.isSecret(value)) throw new TypeError(`Invalid secretKey`);
-        } else if (name === 'secretNonce') {
-          for (let i = 0; i < 64; i += 32)
-            if (!ecc.isSecret(value.subarray(i, i + 32)))
-              throw new TypeError(`Invalid secretNonce`);
         } else if (scalarNames.has(name)) {
           for (let i = 0; i < value.length; i += 32)
             if (!ecc.isScalar(value.subarray(i, i + 32))) throw new TypeError(`Invalid ${name}`);
         }
-        // No need for a public key x-to-curve check. They're liftX'd for use any way.
       }
     }
   }
@@ -943,6 +1067,7 @@ export function MuSigFactory(ecc: Crypto): MuSig {
       throw new TypeError('extraInput is limited to 2^32-1 bytes');
     // No need to check msg, its max size is larger than JS typed array limit
     checkArgs({ sessionId, secretKey, publicKey, xOnlyPublicKey });
+    if (!isCompressedPoint(publicKey)) throw new TypeError('Invalid publicKey');
     let rand: Uint8Array;
     if (secretKey !== undefined) {
       rand = ecc.taggedHash(TAGS.musig_aux, sessionId);
@@ -1047,7 +1172,16 @@ export function MuSigFactory(ecc: Crypto): MuSig {
     },
 
     addExternalNonce: (publicNonce: Uint8Array, secretNonce: Uint8Array): void => {
-      checkArgs({ publicNonce, secretNonce });
+      if (publicNonce.length !== 66)
+        throw new TypeError(`Invalid publicNonce length (${publicNonce.length})`);
+      checkSecretNonce(secretNonce);
+      // The public nonce must be the one these secrets produce; otherwise
+      // partialSign would sign with a nonce the other signers never saw.
+      for (let i = 0; i < 2; i++) {
+        const expected = ecc.getPublicKey(secretNonce.subarray(i * 32, (i + 1) * 32), true);
+        if (expected === null || compare33b(expected, publicNonce.subarray(i * 33, (i + 1) * 33)))
+          throw new Error('Public nonce does not match secret nonce');
+      }
       _nonceCache.set(publicNonce, secretNonce);
     },
 
@@ -1064,8 +1198,9 @@ export function MuSigFactory(ecc: Crypto): MuSig {
       publicKeys: Uint8Array[],
       ...tweaks: Tweak[]
     ): SessionKey => {
-      checkArgs({ aggNonce });
+      // As in BIP327, invalid keys or tweaks are reported before an invalid aggregate nonce.
       const ctx = keyAgg(publicKeys, ...tweaks);
+      if (!isValidAggNonce(aggNonce)) throw new InvalidContributionError(null, 'aggnonce');
       return startSigningSessionInner(aggNonce, msg, publicKeys, ctx);
     },
 
@@ -1082,7 +1217,14 @@ export function MuSigFactory(ecc: Crypto): MuSig {
       publicNonce: Uint8Array;
       sessionKey: SessionKey;
     }): boolean => {
-      checkArgs({ sig, publicKey, publicNonce });
+      if (sig.length !== 32) throw new TypeError(`Invalid sig length (${sig.length})`);
+      checkArgs({ publicKey });
+      // The signer's position among the session's keys identifies who sent a bad nonce.
+      const signer = assertSignerIncluded(publicKey, getSessionValues(sessionKey).publicKeys);
+      if (!isValidPubNonce(publicNonce)) throw new InvalidContributionError(signer, 'pubnonce');
+      // BIP327 PartialSigVerify: a signature outside the group order does not
+      // verify. That is a failed verification, not an error.
+      if (!ecc.isScalar(sig)) return false;
 
       const publicNonces: [Uint8Array, Uint8Array] = [
         publicNonce.subarray(0, 33),
@@ -1099,9 +1241,12 @@ export function MuSigFactory(ecc: Crypto): MuSig {
     },
 
     signAgg: (sigs: Uint8Array[], sessionKey: SessionKey): Uint8Array => {
-      checkArgs({ sigs });
-
+      if (sigs.length === 0) throw new TypeError('0-length sigs not supported');
       const { aggPublicKey, tacc, challenge, finalNonce } = getSessionValues(sessionKey);
+      sigs.forEach((psig, i) => {
+        if (psig.length !== 32 || !ecc.isScalar(psig))
+          throw new InvalidContributionError(i, 'psig');
+      });
       let sPart: Uint8Array = ecc.scalarMultiply(challenge, tacc);
       if (!ecc.hasEvenY(aggPublicKey)) {
         sPart = ecc.scalarNegate(sPart);

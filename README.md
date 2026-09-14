@@ -1,119 +1,178 @@
-# MuSig in TypeScript
+# MuSig2 in TypeScript
 
-Zero dependency implementation of the [MuSig Spec](https://github.com/ElementsProject/secp256k1-zkp/blob/master/doc/musig-spec.mediawiki).
+An implementation of [BIP-327: MuSig2 for BIP340-compatible multi-signatures](https://github.com/bitcoin/bips/blob/master/bip-0327.mediawiki):
+key aggregation, tweaking, nonce generation and aggregation, partial signing
+and verification, signature aggregation, and deterministic (stateless)
+signing.
 
-Similar to [bitcoinjs/BIP32](https://github.com/bitcoinjs/bip32), requires a
-user injected secp256k1 implementation. Two examples provided in
-`test/utils.ts`.
+It passes every official BIP-327 test vector, including all the error cases:
+invalid inputs raise the error the reference implementation raises, blaming the
+same participant for the same contribution.
 
-Works with ECMAScript 2019 if you provide a complete implementation of the
-Crypto interface. If you want to use `base_crypto` as `test/utils.ts` does,
-then requires ECMAScript 2020 BigInt.
+Like [bitcoinjs/bip32](https://github.com/bitcoinjs/bip32), it does not bundle a
+secp256k1 implementation: you inject one. The only runtime dependency is
+`@noble/hashes`. Scalar and structural math (`base_crypto`) uses `BigInt`, so it
+needs ECMAScript 2020.
 
-# Usage
+## Setup
+
+Build a `Crypto` from any tiny-secp256k1-compatible library with the bundled
+adapter:
+
+```typescript
+import { MuSigFactory } from '@brandonblack/musig';
+import { createCrypto } from '@brandonblack/musig/adapters/secp256k1';
+import * as ecc from 'tiny-secp256k1'; // or '@bitcoinerlab/secp256k1' (pure JS)
+
+const musig = MuSigFactory(createCrypto(ecc));
+```
+
+Or implement the `Crypto` interface yourself; `test/utils.ts` has two examples.
+
+## Signing with two rounds
+
+Public keys are 33-byte compressed points. Any `Uint8Array` works; `Buffer` is
+not required.
+
+```typescript
+import { randomBytes } from 'node:crypto';
+
+// The order of the keys is part of the aggregate key. keySort gives a canonical one.
+const publicKeys = musig.keySort([alice.publicKey, bob.publicKey]);
+const aggregateKey = musig.getXOnlyPubkey(musig.keyAgg(publicKeys));
+const msg = transactionHash; // any length; most commonly 32 bytes
+
+// Round 1: every signer makes a nonce and shares only the public nonce.
+const aliceNonce = musig.nonceGen({
+  sessionId: randomBytes(32), // must never repeat
+  secretKey: alice.secretKey,
+  publicKey: alice.publicKey,
+  xOnlyPublicKey: aggregateKey,
+  msg,
+});
+const bobNonce = musig.nonceGen({ sessionId: randomBytes(32), secretKey: bob.secretKey, publicKey: bob.publicKey });
+const aggNonce = musig.nonceAgg([aliceNonce, bobNonce]);
+
+// Round 2: every signer starts the same session and signs exactly once.
+const session = musig.startSigningSession(aggNonce, msg, publicKeys);
+const aliceSig = musig.partialSign({ secretKey: alice.secretKey, publicNonce: aliceNonce, sessionKey: session });
+const bobSig = musig.partialSign({ secretKey: bob.secretKey, publicNonce: bobNonce, sessionKey: session });
+
+// Check each partial signature before aggregating: a bad one would otherwise
+// only show up as an invalid final signature, with no way to tell who sent it.
+musig.partialVerify({ sig: bobSig, publicKey: bob.publicKey, publicNonce: bobNonce, sessionKey: session }); // true
+
+const signature = musig.signAgg([aliceSig, bobSig], session);
+ecc.verifySchnorr(msg, aggregateKey, signature); // true
+```
+
+### Tweaks (e.g. taproot)
+
+Pass tweaks to `keyAgg` and `startSigningSession`. For a taproot key-path spend
+of an output with a script tree, the tweak is BIP-341's
+`tagged_hash("TapTweak", internalKey || merkleRoot)`, applied x-only:
+
+```typescript
+const tweak = { tweak: tapTweak, xOnly: true };
+const outputKey = musig.getXOnlyPubkey(musig.keyAgg(publicKeys, tweak));
+const session = musig.startSigningSession(aggNonce, msg, publicKeys, tweak);
+```
+
+## Signing in one round: deterministic signing
+
+A signer that contributes its nonce **last**, after every other nonce is fixed,
+can sign in a single step without keeping any nonce state:
+
+```typescript
+const aggOtherNonce = musig.nonceAgg([aliceNonce]); // every other signer's public nonce
+const { publicNonce, sig } = musig.deterministicSign({
+  secretKey: bob.secretKey,
+  aggOtherNonce,
+  publicKeys,
+  tweaks: [tweak],
+  msg,
+  rand: randomBytes(32), // strongly recommended, see below
+});
+// Send publicNonce and sig back. Alice then signs with her stored nonce and aggregates.
+```
+
+This is only safe when the deterministic signer really is last. `rand` mixes
+fresh randomness into the nonce; without it the nonce depends only on the
+inputs, which leaves the signer more exposed to fault attacks.
+
+`deterministicNonceGen` returns just the public nonce, for a signer that wants to
+publish its nonce first and sign later with the same arguments.
+
+## Nonces
+
+Reusing a secret nonce for two different messages reveals the secret key.
+
+- `nonceGen` keeps the secret nonce in an in-memory cache keyed by the public
+  nonce object, and `partialSign` deletes it before anything else can fail, so
+  a nonce cannot be used twice within a process.
+- `nonceGenExtractable` also returns the 97-byte secret nonce, for signers that
+  must persist it between rounds. Store it like a private key, and erase it
+  before or as you sign.
+- `addExternalNonce` puts a stored secret nonce back into the cache. It refuses
+  a secret nonce with out-of-range values, or one that does not produce the
+  given public nonce.
+
+## Errors
+
+Invalid input from another participant throws an `InvalidContributionError`,
+BIP-327's way of saying who to hold accountable:
+
+```typescript
+import { InvalidContributionError } from '@brandonblack/musig';
+
+try {
+  musig.nonceAgg(publicNonces);
+} catch (e) {
+  if (e instanceof InvalidContributionError) {
+    e.signer; // index of the signer at fault, or null for the aggregator
+    e.contrib; // 'pubkey' | 'pubnonce' | 'aggnonce' | 'aggothernonce' | 'psig'
+  }
+}
+```
+
+| Thrown by | When | Error |
+| --- | --- | --- |
+| `keyAgg`, `startSigningSession`, `deterministicSign` | public key `i` is not a valid compressed point | `InvalidContributionError(i, 'pubkey')` |
+| `nonceAgg` | public nonce `i` is invalid | `InvalidContributionError(i, 'pubnonce')` |
+| `partialVerify` | the signer's public nonce is invalid | `InvalidContributionError(signer, 'pubnonce')` |
+| `startSigningSession` | the aggregate nonce is invalid | `InvalidContributionError(null, 'aggnonce')` |
+| `deterministicSign` | `aggOtherNonce` is invalid | `InvalidContributionError(null, 'aggothernonce')` |
+| `signAgg` | partial signature `i` is not less than n | `InvalidContributionError(i, 'psig')` |
+
+Invalid values of your own throw an `Error` with the reference implementation's
+message, for example `The tweak must be less than n.`, `first secnonce value is
+out of range.`, or `The signer's pubkey must be included in the list of pubkeys.`
+Wrong lengths throw a `TypeError`.
+
+`partialVerify` returns `false`, rather than throwing, for a signature that does
+not verify, including one that is not less than n.
+
+## Security notes
+
+- This is alpha software. Review it before trusting it with funds.
+- JavaScript cannot guarantee constant-time arithmetic. `BigInt` scalar
+  operations on secrets may leak timing information to a local attacker.
+- Validation is explicit: public keys and nonces are checked against the curve
+  equation in `base_crypto`, not left to the injected point-math backend.
+- Always verify other signers' partial signatures before aggregating.
+
+## Development
 
 ```shell
-npm i
-npm run test # runs build
+npm ci
+npm test       # format check, lint, build, and the full test suite with coverage
 npm run bench
 ```
 
-This example uses `Buffer` for convenience, but it is not required, any
-`Uint8Array` will do.
+The test suite runs every test, including the BIP-327 vectors in
+`test/bip-vectors/`, against three backends: noble, tiny-secp256k1, and the
+bundled adapter. Update the vectors from
+[bitcoin/bips](https://github.com/bitcoin/bips/tree/master/bip-0327/vectors).
 
-```typescript
-import { MuSigFactory, Nonce } from '.';
-import { tinyCrypto } from './test/utils';
-import * as tiny from 'tiny-secp256k1';
-
-const musig = MuSigFactory(tinyCrypto);
-
-const fromHex = (hex: string): Uint8Array => Buffer.from(hex, 'hex');
-const toHex = (bytes: Uint8Array): string => Buffer.from(bytes).toString('hex');
-const secretKey1 = fromHex('be01d8dcf3879a0fec05130ca95d35bf7823833e3cdf91e310408606717055d9');
-const pubKey1 = fromHex('648c0c80c8520875c22a1cf31cd718b72a50e381731bc7f8efec9944074cb21b');
-const secretKey2 = fromHex('644b07a5cb70f68316cd9a51cabdc61c4d0b1f38b189d0c92370a3844fd0241f');
-const pubKey2 = fromHex('8c9444613a1bb8b442b81cc7fbf81a186a34d7c4e596362543e17dde3efdc4b3');
-const tweak = fromHex('8df63a82e5e71884bb16e2896e12ba2b7fe0e670d466be03b578fc435d5c9876');
-
-const { publicKey, keyAggSession } = musig.keyAgg(
-  [pubKey1, pubKey2],
-  { tweaks: [tweak], tweaksXOnly: [true] }
-);
-
-const msg = fromHex('f1d1d6ef2d97319149aaed92c69ebb21d6c54c0fc4e908f4f4ee42a1e5b8b854');
-
-// Signing round 1 - generate nonces, share public nonces
-
-const nonce1: { secretNonce?: Uint8Array, publicNonce: Uint8Array } = musig.nonceGen({
-  sessionId: fromHex('0000000000000000000000000000000000000000000000000000000000000001'),
-  secretKey: secretKey1,
-  msg,
-  publicKey,
-});
-
-const nonce2: { secretNonce?: Uint8Array, publicNonce: Uint8Array } = musig.nonceGen({
-  sessionId: fromHex('0000000000000000000000000000000000000000000000000000000000000001'),
-  secretKey: secretKey2,
-  msg,
-  publicKey,
-});
-
-const sharedPublicNonces = [nonce1.publicNonce, nonce2.publicNonce];
-
-const aggNonce = musig.nonceAgg(sharedPublicNonces);
-
-// Signing round 2 - generate and share partial sigs, verify and aggregate
-
-const { sig: sig1, signingSession: signingSession1 } = musig.partialSign({
-  msg,
-  secretKey: secretKey1,
-  nonce: nonce1 as Nonce,
-  aggNonce,
-  keyAggSession
-});
-delete nonce1.secretNonce;
-
-const { sig: sig2, signingSession: signingSession2 } = musig.partialSign({
-  msg,
-  secretKey: secretKey2,
-  nonce: nonce2 as Nonce,
-  aggNonce,
-  keyAggSession
-});
-delete nonce2.secretNonce;
-
-const sharedSigs = [sig1, sig2];
-
-const check2By1 = musig.partialVerify({
-  sig: sharedSigs[1],
-  msg,
-  publicKey: pubKey2,
-  publicNonce: sharedPublicNonces[1],
-  aggNonce,
-  keyAggSession,
-  signingSession: signingSession1 // Optional
-});
-
-const check1By2 = musig.partialVerify({
-  sig: sharedSigs[0],
-  msg,
-  publicKey: pubKey1,
-  publicNonce: sharedPublicNonces[0],
-  aggNonce,
-  keyAggSession,
-  signingSession: signingSession2 // Optional
-});
-
-console.log(`check2By1: ${!!check2By1}, check1By2: ${!!check1By2}`);
-
-const signingSession = musig.createSigningSession(aggNonce, msg, keyAggSession);
-// All of the signing sessions are interchangeable, and derived from public information
-const sig = musig.signAgg(sharedSigs, signingSession);
-
-console.log(toHex(sig));
-// 13a8d88bb5727fe945293f81f0f1000eecb8ded5ca950bcfb74d6536d456372b9ae00ccb9cbacc00a3bca07129920b88d4df4f5c24ece1f7159ff94c1dde1bba
-
-const valid = tiny.verifySchnorr(msg, publicKey, sig);
-console.log(`final sig valid: ${valid}`);
-```
+`lib/` is committed so the package can be installed straight from git; rebuild
+it with `npm run build` before committing source changes.

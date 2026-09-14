@@ -2,7 +2,7 @@ import * as nc from 'node:crypto';
 import { secp256k1, schnorr } from '@noble/curves/secp256k1';
 import { hashToPrivateScalar } from '@noble/curves/abstract/modular';
 import { numberToBytesBE } from '@noble/curves/abstract/utils';
-import { KeyGenContext, MuSigFactory, SessionKey } from '../index';
+import { InvalidContributionError, KeyGenContext, MuSigFactory, SessionKey } from '../index';
 import { nobleCrypto, tinyCrypto } from './utils';
 import * as tinyEcc from 'tiny-secp256k1';
 import { createCrypto } from '../adapters/secp256k1';
@@ -46,6 +46,36 @@ const notSecret = Buffer.from(
   'hex'
 );
 const validTweak = randomPrivateKey();
+
+interface BipError {
+  type: string;
+  signer?: number | null;
+  contrib?: string;
+  message?: string;
+}
+
+/**
+ * Asserts that `attempt` throws exactly what a BIP327 vector expects: an
+ * InvalidContributionError blaming the same signer for the same contribution,
+ * or an error with the reference implementation's message.
+ */
+function expectBipError(attempt: () => unknown, expected: BipError): void {
+  let thrown: unknown;
+  try {
+    attempt();
+  } catch (e) {
+    thrown = e;
+  }
+  if (thrown === undefined) throw new Error('Expected an error, but none was thrown');
+  if (expected.type === 'invalid_contribution') {
+    expect(thrown).toBeInstanceOf(InvalidContributionError);
+    const { signer, contrib } = thrown as InvalidContributionError;
+    expect({ signer, contrib }).toEqual({ signer: expected.signer, contrib: expected.contrib });
+  } else {
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe(expected.message);
+  }
+}
 
 const nonceArgs = {
   sessionId: Buffer.from(nonce_gen_vectors.test_cases[0].rand_, 'hex'),
@@ -197,7 +227,15 @@ for (const { cryptoName, crypto } of cryptos) {
         }
       });
 
-    // TODO: key_sort_vectors
+    describe('keySort vectors', function () {
+      it('sorts keys', function () {
+        const sorted = musig.keySort(key_sort_vectors.pubkeys.map((k) => Buffer.from(k, 'hex')));
+        expect(sorted.map((k) => Buffer.from(k).toString('hex'))).toEqual(
+          key_sort_vectors.sorted_pubkeys.map((k) => k.toLowerCase())
+        );
+      });
+    });
+
     describe('keyAgg vectors', function () {
       const { pubkeys, tweaks, valid_test_cases, error_test_cases } = key_agg_vectors;
       valid_test_cases.forEach(({ key_indices, expected }, index) => {
@@ -209,18 +247,19 @@ for (const { cryptoName, crypto } of cryptos) {
         });
       });
 
+      // (These used to call jasmine's `fail()`, which jest-circus does not
+      // define: the ReferenceError it threw was caught by the test itself, so
+      // the cases could never fail.)
       error_test_cases.forEach(
         ({ key_indices, tweak_indices, is_xonly, error, comment }, index) => {
           it(`fails to aggregate keys ${index} "${comment || ''}"`, function () {
             const publicKeys = key_indices.map((i) => Buffer.from(pubkeys[i], 'hex'));
-            const tweaksI = tweak_indices.map((i) => Buffer.from(tweaks[i], 'hex'));
-            try {
-              musig.keyAgg(publicKeys);
-              fail();
-            } catch (e) {
-              // TODO: Maybe check the messages, but they're different from the public fixtures
-              expect(e instanceof Error).toBe(true);
-            }
+            // is_xonly lines up with tweak_indices by position.
+            const tweaksI = tweak_indices.map((i, k) => ({
+              tweak: Buffer.from(tweaks[i], 'hex'),
+              xOnly: is_xonly[k],
+            }));
+            expectBipError(() => musig.keyAgg(publicKeys, ...tweaksI), error);
           });
         }
       );
@@ -246,9 +285,9 @@ for (const { cryptoName, crypto } of cryptos) {
         ) => {
           it(`tweaks and signs ${index} "${comment || ''}"`, function () {
             const publicKeys = key_indices.map((i) => Buffer.from(pubkeys[i], 'hex'));
-            const tweaksI = tweak_indices.map((i) => ({
+            const tweaksI = tweak_indices.map((i, k) => ({
               tweak: Buffer.from(tweaks[i], 'hex'),
-              xOnly: is_xonly[i],
+              xOnly: is_xonly[k],
             }));
 
             const message = Buffer.from(msg, 'hex');
@@ -281,17 +320,11 @@ for (const { cryptoName, crypto } of cryptos) {
         ({ key_indices, tweak_indices, is_xonly, error, comment }, index) => {
           it(`fails to tweak key ${index} "${comment || ''}"`, function () {
             const publicKeys = key_indices.map((i) => Buffer.from(pubkeys[i], 'hex'));
-            const tweaksI = tweak_indices.map((i) => ({
+            const tweaksI = tweak_indices.map((i, k) => ({
               tweak: Buffer.from(tweaks[i], 'hex'),
-              xOnly: is_xonly[i],
+              xOnly: is_xonly[k],
             }));
-            try {
-              musig.keyAgg(publicKeys, ...tweaksI);
-              fail();
-            } catch (e) {
-              // TODO: Maybe check the messages, but they're different from the public fixtures
-              expect(e instanceof Error).toBe(true);
-            }
+            expectBipError(() => musig.keyAgg(publicKeys, ...tweaksI), error);
           });
         }
       );
@@ -299,7 +332,7 @@ for (const { cryptoName, crypto } of cryptos) {
 
     describe('nonceGen vectors', function () {
       nonce_gen_vectors.test_cases.forEach(
-        ({ rand_, sk, pk, aggpk, msg, extra_in, expected }, index) => {
+        ({ rand_, sk, pk, aggpk, msg, extra_in, expected_pubnonce }, index) => {
           it(`generates nonces ${index}`, function () {
             const args = {
               sessionId: Buffer.from(rand_, 'hex'),
@@ -310,14 +343,7 @@ for (const { cryptoName, crypto } of cryptos) {
               extraInput: extra_in === null ? undefined : Buffer.from(extra_in, 'hex'),
             };
             const publicNonce = musig.nonceGen(args);
-            const secretNonces = [
-              Buffer.from(expected.substring(0, 64), 'hex'),
-              Buffer.from(expected.substring(64, 128), 'hex'),
-            ];
-            const expectedNonce = Buffer.concat(
-              secretNonces.map((s) => Buffer.from(secp256k1.getPublicKey(s, true)))
-            );
-            expect(Buffer.from(publicNonce).toString('hex')).toBe(expectedNonce.toString('hex'));
+            expect(Buffer.from(publicNonce).toString('hex')).toBe(expected_pubnonce.toLowerCase());
           });
         }
       );
@@ -325,7 +351,7 @@ for (const { cryptoName, crypto } of cryptos) {
 
     describe('nonceGenExtractable', function () {
       nonce_gen_vectors.test_cases.forEach(
-        ({ rand_, sk, pk, aggpk, msg, extra_in, expected }, index) => {
+        ({ rand_, sk, pk, aggpk, msg, extra_in, expected_secnonce, expected_pubnonce }, index) => {
           it(`returns the secret nonce matching BIP327 vector ${index}`, function () {
             const args = {
               sessionId: Buffer.from(rand_, 'hex'),
@@ -336,12 +362,9 @@ for (const { cryptoName, crypto } of cryptos) {
               extraInput: extra_in === null ? undefined : Buffer.from(extra_in, 'hex'),
             };
             const { publicNonce, secretNonce } = musig.nonceGenExtractable(args);
-            // secret nonce layout: k1(32) || k2(32) || publicKey(33)
-            expect(secretNonce.length).toBe(97);
-            expect(Buffer.from(secretNonce.subarray(0, 64)).toString('hex')).toBe(
-              expected.substring(0, 128).toLowerCase()
-            );
-            expect(Buffer.from(secretNonce.subarray(64)).toString('hex')).toBe(pk.toLowerCase());
+            // secret nonce layout, as in BIP327: k1(32) || k2(32) || publicKey(33)
+            expect(Buffer.from(secretNonce).toString('hex')).toBe(expected_secnonce.toLowerCase());
+            expect(Buffer.from(publicNonce).toString('hex')).toBe(expected_pubnonce.toLowerCase());
             // publicNonce must equal what nonceGen produces for identical args
             expect(Buffer.from(publicNonce).toString('hex')).toBe(
               Buffer.from(musig.nonceGen(args)).toString('hex')
@@ -361,16 +384,19 @@ for (const { cryptoName, crypto } of cryptos) {
     });
 
     describe('nonceAgg vectors', function () {
-      const {
-        pnonces,
-        valid_test_cases,
-        error_test_cases, // TODO
-      } = nonce_agg_vectors;
+      const { pnonces, valid_test_cases, error_test_cases } = nonce_agg_vectors;
       valid_test_cases.forEach(({ pnonce_indices, expected, comment }, index) => {
         it(`aggregatesNonces ${index} "${comment || ''}"`, function () {
           const nonces = pnonce_indices.map((i) => Buffer.from(pnonces[i], 'hex'));
           const aggNonce = musig.nonceAgg(nonces);
           expect(Buffer.from(aggNonce).toString('hex')).toBe(expected.toLowerCase());
+        });
+      });
+
+      error_test_cases.forEach(({ pnonce_indices, error, comment }, index) => {
+        it(`fails to aggregate nonces ${index} "${comment || ''}"`, function () {
+          const nonces = pnonce_indices.map((i) => Buffer.from(pnonces[i], 'hex'));
+          expectBipError(() => musig.nonceAgg(nonces), error);
         });
       });
     });
@@ -384,9 +410,9 @@ for (const { cryptoName, crypto } of cryptos) {
         aggnonces,
         msgs,
         valid_test_cases,
-        sign_error_test_cases, // TODO
-        verify_fail_test_cases, // TODO
-        verify_error_test_cases, // TODO
+        sign_error_test_cases,
+        verify_fail_test_cases,
+        verify_error_test_cases,
       } = sign_verify_vectors;
 
       it('checks public key', function () {
@@ -441,16 +467,78 @@ for (const { cryptoName, crypto } of cryptos) {
           });
         }
       );
+
+      sign_error_test_cases.forEach(
+        ({ key_indices, aggnonce_index, msg_index, secnonce_index, error, comment }, index) => {
+          it(`fails to partial sign ${index} "${comment || ''}"`, function () {
+            const attempt = () => {
+              const publicKeys = key_indices.map((i) => Buffer.from(pubkeys[i], 'hex'));
+              const sessionKey = musig.startSigningSession(
+                Buffer.from(aggnonces[aggnonce_index], 'hex'),
+                Buffer.from(msgs[msg_index], 'hex'),
+                publicKeys
+              );
+              // pnonces[0] is the signer's public nonce, matching secnonces[0].
+              const publicNonce = Buffer.from(pnonces[0], 'hex');
+              musig.addExternalNonce(publicNonce, Buffer.from(secnonces[secnonce_index], 'hex'));
+              return musig.partialSign({
+                secretKey: Buffer.from(sk, 'hex'),
+                publicNonce,
+                sessionKey,
+                verify: false,
+              });
+            };
+            expectBipError(attempt, error);
+          });
+        }
+      );
+
+      verify_fail_test_cases.forEach(
+        ({ sig, key_indices, nonce_indices, msg_index, signer_index, comment }, index) => {
+          it(`rejects partial signature ${index} "${comment || ''}"`, function () {
+            const publicKeys = key_indices.map((i) => Buffer.from(pubkeys[i], 'hex'));
+            const pubNonces = nonce_indices.map((i) => Buffer.from(pnonces[i], 'hex'));
+            const sessionKey = musig.startSigningSession(
+              musig.nonceAgg(pubNonces),
+              Buffer.from(msgs[msg_index], 'hex'),
+              publicKeys
+            );
+            const result = musig.partialVerify({
+              sig: Buffer.from(sig, 'hex'),
+              publicKey: publicKeys[signer_index],
+              publicNonce: pubNonces[signer_index],
+              sessionKey,
+            });
+            expect(result).toBe(false);
+          });
+        }
+      );
+
+      verify_error_test_cases.forEach(
+        ({ sig, key_indices, nonce_indices, msg_index, signer_index, error, comment }, index) => {
+          it(`fails to verify partial signature ${index} "${comment || ''}"`, function () {
+            expectBipError(() => {
+              const publicKeys = key_indices.map((i) => Buffer.from(pubkeys[i], 'hex'));
+              const pubNonces = nonce_indices.map((i) => Buffer.from(pnonces[i], 'hex'));
+              const sessionKey = musig.startSigningSession(
+                Buffer.from(aggnonces[0], 'hex'),
+                Buffer.from(msgs[msg_index], 'hex'),
+                publicKeys
+              );
+              return musig.partialVerify({
+                sig: Buffer.from(sig, 'hex'),
+                publicKey: publicKeys[signer_index],
+                publicNonce: pubNonces[signer_index],
+                sessionKey,
+              });
+            }, error);
+          });
+        }
+      );
     });
 
     describe('deterministic sign vectors', function () {
-      const {
-        sk,
-        pubkeys,
-        msgs,
-        valid_test_cases,
-        error_test_cases, // TODO
-      } = det_sign_vectors;
+      const { sk, pubkeys, msgs, valid_test_cases, error_test_cases } = det_sign_vectors;
 
       const secretKey = Buffer.from(sk, 'hex');
       let publicKey: Uint8Array;
@@ -525,18 +613,34 @@ for (const { cryptoName, crypto } of cryptos) {
           });
         }
       );
+
+      error_test_cases.forEach(
+        (
+          { rand, aggothernonce, key_indices, tweaks, is_xonly, msg_index, error, comment },
+          index
+        ) => {
+          const args = () => ({
+            secretKey,
+            aggOtherNonce: Buffer.from(aggothernonce, 'hex'),
+            publicKeys: key_indices.map((i) => Buffer.from(pubkeys[i], 'hex')),
+            tweaks: tweaks.map((t, i) => ({ tweak: Buffer.from(t, 'hex'), xOnly: is_xonly[i] })),
+            msg: Buffer.from(msgs[msg_index], 'hex'),
+            rand: rand === null ? undefined : Buffer.from(rand, 'hex'),
+          });
+          it(`fails to sign deterministically ${index} "${comment || ''}"`, function () {
+            expectBipError(() => musig.deterministicSign({ ...args(), verify: false }), error);
+          });
+
+          it(`fails to generate a deterministic nonce ${index} "${comment || ''}"`, function () {
+            expectBipError(() => musig.deterministicNonceGen(args()), error);
+          });
+        }
+      );
     });
 
     describe('sig agg vectors', function () {
-      const {
-        pubkeys,
-        pnonces,
-        tweaks,
-        psigs,
-        msg,
-        valid_test_cases,
-        error_test_cases, // TODO
-      } = sig_agg_vectors;
+      const { pubkeys, pnonces, tweaks, psigs, msg, valid_test_cases, error_test_cases } =
+        sig_agg_vectors;
       const message = Buffer.from(msg, 'hex');
       valid_test_cases.forEach(
         (
@@ -549,9 +653,9 @@ for (const { cryptoName, crypto } of cryptos) {
             expect(Buffer.from(aggNonce).toString('hex')).toEqual(aggnonce.toLowerCase());
 
             const publicKeys = key_indices.map((i) => Buffer.from(pubkeys[i], 'hex'));
-            const tweaksI = tweak_indices.map((i) => ({
+            const tweaksI = tweak_indices.map((i, k) => ({
               tweak: Buffer.from(tweaks[i], 'hex'),
-              xOnly: is_xonly[i],
+              xOnly: is_xonly[k],
             }));
             const partialSigs = psig_indices.map((i) => Buffer.from(psigs[i], 'hex'));
 
@@ -563,6 +667,33 @@ for (const { cryptoName, crypto } of cryptos) {
             const aggPk = musig.getXOnlyPubkey(sessionKey);
             // Something in signAgg, nonce processing, or maybe key aggregation broken
             expect(schnorr.verify(sig, message, aggPk)).toBe(true);
+          });
+        }
+      );
+
+      error_test_cases.forEach(
+        (
+          { aggnonce, key_indices, tweak_indices, is_xonly, psig_indices, error, comment },
+          index
+        ) => {
+          it(`fails to aggregate signatures ${index} "${comment || ''}"`, function () {
+            expectBipError(() => {
+              const publicKeys = key_indices.map((i) => Buffer.from(pubkeys[i], 'hex'));
+              const tweaksI = tweak_indices.map((i, k) => ({
+                tweak: Buffer.from(tweaks[i], 'hex'),
+                xOnly: is_xonly[k],
+              }));
+              const sessionKey = musig.startSigningSession(
+                Buffer.from(aggnonce, 'hex'),
+                message,
+                publicKeys,
+                ...tweaksI
+              );
+              return musig.signAgg(
+                psig_indices.map((i) => Buffer.from(psigs[i], 'hex')),
+                sessionKey
+              );
+            }, error);
           });
         }
       );
@@ -683,42 +814,279 @@ for (const { cryptoName, crypto } of cryptos) {
     });
 
     describe('partialSign errors', function () {
+      const signerKey = randomPrivateKey();
+      const signerPub = secp256k1.getPublicKey(signerKey, true);
       const aggNonce = new Uint8Array(66);
       aggNonce.set(secp256k1.getPublicKey(randomPrivateKey(), true), 0);
       aggNonce.set(secp256k1.getPublicKey(randomPrivateKey(), true), 33);
-      const sessionKey = musig.startSigningSession(aggNonce, randomBytes(), [validPub]);
+      const sessionKey = musig.startSigningSession(aggNonce, randomBytes(), [signerPub]);
       const secretNonce = new Uint8Array(97);
-      const fakePublicNonce = new Uint8Array(66);
       secretNonce.set(randomPrivateKey(), 0);
       secretNonce.set(randomPrivateKey(), 32);
-      secretNonce.set(validPub, 64);
+      secretNonce.set(signerPub, 64);
 
-      for (const badNonceI of [0, 1]) {
-        it('rejects bad secretNonce', function () {
+      // The public nonce a secret nonce produces: k1*G || k2*G.
+      const publicNonceFor = (secret: Uint8Array): Uint8Array => {
+        const publicNonce = new Uint8Array(66);
+        publicNonce.set(secp256k1.getPublicKey(secret.subarray(0, 32), true), 0);
+        publicNonce.set(secp256k1.getPublicKey(secret.subarray(32, 64), true), 33);
+        return publicNonce;
+      };
+
+      for (const [badNonceI, which] of [
+        [0, 'first'],
+        [1, 'second'],
+      ] as const) {
+        it(`rejects an out-of-range ${which} secret nonce value`, function () {
           const invalidSecretNonce = Uint8Array.from(secretNonce);
           invalidSecretNonce.set(notSecret, badNonceI * 32);
-
-          expect(() => {
-            musig.addExternalNonce(fakePublicNonce, invalidSecretNonce);
-            musig.partialSign({
-              secretKey: randomPrivateKey(),
-              publicNonce: fakePublicNonce,
-              sessionKey,
-            });
-          }).toThrow(/Invalid secretNonce/);
+          expect(() => musig.addExternalNonce(new Uint8Array(66), invalidSecretNonce)).toThrow(
+            `${which} secnonce value is out of range.`
+          );
         });
       }
 
-      it('rejects bad secretKey', function () {
-        musig.addExternalNonce(fakePublicNonce, secretNonce);
-        expect(() =>
-          musig.partialSign({
-            secretKey: notSecret,
-            publicNonce: fakePublicNonce,
-            sessionKey,
-          })
-        ).toThrow(/Invalid secretKey/);
+      it('rejects a public nonce the secret nonce does not produce', function () {
+        const otherSecretNonce = Uint8Array.from(secretNonce);
+        otherSecretNonce.set(randomPrivateKey(), 0);
+        expect(() => musig.addExternalNonce(publicNonceFor(otherSecretNonce), secretNonce)).toThrow(
+          'Public nonce does not match secret nonce'
+        );
       });
+
+      it('rejects an out-of-range secret key', function () {
+        const publicNonce = publicNonceFor(secretNonce);
+        musig.addExternalNonce(publicNonce, secretNonce);
+        expect(() => musig.partialSign({ secretKey: notSecret, publicNonce, sessionKey })).toThrow(
+          'secret key value is out of range.'
+        );
+      });
+
+      it('rejects a secret key the nonce was not generated for', function () {
+        const publicNonce = publicNonceFor(secretNonce);
+        musig.addExternalNonce(publicNonce, secretNonce);
+        expect(() =>
+          musig.partialSign({ secretKey: randomPrivateKey(), publicNonce, sessionKey })
+        ).toThrow('Public key does not match nonce_gen argument');
+      });
+
+      it('signs with the right secret key', function () {
+        const publicNonce = publicNonceFor(secretNonce);
+        musig.addExternalNonce(publicNonce, secretNonce);
+        expect(() =>
+          musig.partialSign({ secretKey: signerKey, publicNonce, sessionKey, verify: true })
+        ).not.toThrow();
+      });
+    });
+
+    describe('input validation', function () {
+      const keys = [randomPrivateKey(), randomPrivateKey()].map((sk) =>
+        secp256k1.getPublicKey(sk, true)
+      );
+      const randomPubNonce = (): Uint8Array => {
+        const publicNonce = new Uint8Array(66);
+        publicNonce.set(secp256k1.getPublicKey(randomPrivateKey(), true), 0);
+        publicNonce.set(secp256k1.getPublicKey(randomPrivateKey(), true), 33);
+        return publicNonce;
+      };
+      // Flipping the parity byte of both points negates the nonce.
+      const negate = (publicNonce: Uint8Array): Uint8Array => {
+        const negated = Uint8Array.from(publicNonce);
+        negated[0] ^= 1;
+        negated[33] ^= 1;
+        return negated;
+      };
+      const hex = (bytes: Uint8Array): string => Buffer.from(bytes).toString('hex');
+      const newSession = (): SessionKey =>
+        musig.startSigningSession(
+          musig.nonceAgg([randomPubNonce(), randomPubNonce()]),
+          randomBytes(),
+          keys
+        );
+
+      it('blames the signer whose public key is invalid', function () {
+        expectBipError(() => musig.keyAgg([validPub, invalidPub]), {
+          type: 'invalid_contribution',
+          signer: 1,
+          contrib: 'pubkey',
+        });
+      });
+
+      it('keeps adding nonces after a running sum reaches infinity', function () {
+        const a = randomPubNonce();
+        const b = randomPubNonce();
+        expect(hex(musig.nonceAgg([a, negate(a), b]))).toBe(hex(musig.nonceAgg([b])));
+        expect(hex(musig.nonceAgg([a, negate(a)]))).toBe('00'.repeat(66));
+      });
+
+      it('treats a zero tweak as no tweak', function () {
+        const zero = new Uint8Array(32);
+        const untweaked = hex(musig.getXOnlyPubkey(musig.keyAgg(keys)));
+        expect(hex(musig.getXOnlyPubkey(musig.keyAgg(keys, zero)))).toBe(untweaked);
+        expect(hex(musig.getXOnlyPubkey(musig.keyAgg(keys, { tweak: zero, xOnly: true })))).toBe(
+          untweaked
+        );
+      });
+
+      it('rejects a tweak of the wrong length', function () {
+        expectBipError(() => musig.keyAgg(keys, new Uint8Array(31)), {
+          type: 'value',
+          message: 'The tweak must be a 32-byte array.',
+        });
+      });
+
+      it('blames the aggregator for an aggregate nonce of the wrong length', function () {
+        expectBipError(() => musig.startSigningSession(new Uint8Array(65), randomBytes(), keys), {
+          type: 'invalid_contribution',
+          signer: null,
+          contrib: 'aggnonce',
+        });
+      });
+
+      it('accepts an aggregate nonce whose points are at infinity', function () {
+        expect(() =>
+          musig.startSigningSession(new Uint8Array(66), randomBytes(), keys)
+        ).not.toThrow();
+      });
+
+      it('blames the signer whose partial signature is out of range', function () {
+        expectBipError(() => musig.signAgg([randomBytes(), notSecret], newSession()), {
+          type: 'invalid_contribution',
+          signer: 1,
+          contrib: 'psig',
+        });
+      });
+
+      it('blames the verified signer for an invalid public nonce', function () {
+        const badNonce = randomPubNonce();
+        badNonce[33] = 4;
+        expectBipError(
+          () =>
+            musig.partialVerify({
+              sig: randomBytes(),
+              publicKey: keys[1],
+              publicNonce: badNonce,
+              sessionKey: newSession(),
+            }),
+          { type: 'invalid_contribution', signer: 1, contrib: 'pubnonce' }
+        );
+      });
+
+      it('refuses to verify for a public key outside the session', function () {
+        expectBipError(
+          () =>
+            musig.partialVerify({
+              sig: randomBytes(),
+              publicKey: validPub,
+              publicNonce: randomPubNonce(),
+              sessionKey: newSession(),
+            }),
+          { type: 'value', message: "The signer's pubkey must be included in the list of pubkeys." }
+        );
+      });
+
+      it('rejects nonce generation for an invalid public key', function () {
+        expect(() => musig.nonceGen({ ...nonceArgs, publicKey: invalidPub })).toThrow(
+          'Invalid publicKey'
+        );
+      });
+
+      it('gives InvalidContributionError a useful name and message', function () {
+        const error = new InvalidContributionError(2, 'psig');
+        expect(error).toBeInstanceOf(Error);
+        expect(error.name).toBe('InvalidContributionError');
+        expect(error.message).toBe('Invalid psig from signer 2');
+        expect(new InvalidContributionError(null, 'aggnonce').message).toBe('Invalid aggnonce');
+      });
+    });
+  });
+}
+
+for (const { cryptoName, crypto } of cryptos) {
+  describe(`${cryptoName}: edge cases`, function () {
+    const musig = MuSigFactory(crypto);
+    const hex = (bytes: Uint8Array): string => Buffer.from(bytes).toString('hex');
+    const newSigner = () => {
+      const secretKey = randomPrivateKey();
+      return { secretKey, publicKey: secp256k1.getPublicKey(secretKey, true) };
+    };
+    const negateScalar = (k: Uint8Array): Uint8Array =>
+      numberToBytesBE(secp256k1.CURVE.n - BigInt(`0x${hex(k)}`), 32);
+
+    // An aggregate nonce half at infinity is valid, and takes a different path
+    // when the final nonce R is computed. Build one on purpose: b's nonce
+    // cancels a's in that half, and b still knows its own secret nonce.
+    for (const half of [0, 1]) {
+      it(`signs and verifies when half ${half} of the aggregate nonce is at infinity`, function () {
+        const [a, b] = [newSigner(), newSigner()];
+        const publicKeys = [a.publicKey, b.publicKey];
+        const msg = randomBytes();
+        const na = musig.nonceGenExtractable({
+          sessionId: randomBytes(),
+          secretKey: a.secretKey,
+          publicKey: a.publicKey,
+          msg,
+        });
+
+        const bSecrets = [randomPrivateKey(), randomPrivateKey()];
+        bSecrets[half] = negateScalar(na.secretNonce.subarray(half * 32, (half + 1) * 32));
+        const bSecretNonce = new Uint8Array(97);
+        bSecretNonce.set(bSecrets[0], 0);
+        bSecretNonce.set(bSecrets[1], 32);
+        bSecretNonce.set(b.publicKey, 64);
+        const bPublicNonce = new Uint8Array(66);
+        bPublicNonce.set(secp256k1.getPublicKey(bSecrets[0], true), 0);
+        bPublicNonce.set(secp256k1.getPublicKey(bSecrets[1], true), 33);
+        musig.addExternalNonce(bPublicNonce, bSecretNonce);
+
+        const aggNonce = musig.nonceAgg([na.publicNonce, bPublicNonce]);
+        expect(hex(aggNonce.subarray(half * 33, (half + 1) * 33))).toBe('00'.repeat(33));
+
+        const sessionKey = musig.startSigningSession(aggNonce, msg, publicKeys);
+        const sigs = [
+          musig.partialSign({ secretKey: a.secretKey, publicNonce: na.publicNonce, sessionKey }),
+          musig.partialSign({ secretKey: b.secretKey, publicNonce: bPublicNonce, sessionKey }),
+        ];
+        const signature = musig.signAgg(sigs, sessionKey);
+        expect(schnorr.verify(signature, msg, musig.getXOnlyPubkey(sessionKey))).toBe(true);
+      });
+    }
+
+    it('rejects wrong-length inputs with a TypeError', function () {
+      const { secretKey, publicKey } = newSigner();
+      const { publicNonce, secretNonce } = musig.nonceGenExtractable({
+        sessionId: randomBytes(),
+        secretKey,
+        publicKey,
+      });
+      const sessionKey = musig.startSigningSession(musig.nonceAgg([publicNonce]), randomBytes(), [
+        publicKey,
+      ]);
+
+      expect(() => musig.addExternalNonce(new Uint8Array(65), secretNonce)).toThrow(TypeError);
+      expect(() => musig.addExternalNonce(publicNonce, new Uint8Array(96))).toThrow(TypeError);
+      expect(() =>
+        musig.partialSign({ secretKey, publicNonce: new Uint8Array(65), sessionKey })
+      ).toThrow(TypeError);
+      expect(() =>
+        musig.partialVerify({ sig: new Uint8Array(31), publicKey, publicNonce, sessionKey })
+      ).toThrow(TypeError);
+      expect(() => musig.nonceAgg([])).toThrow(TypeError);
+      expect(() => musig.signAgg([], sessionKey)).toThrow(TypeError);
+      // Last, because it consumes the cached secret nonce.
+      expect(() =>
+        musig.partialSign({ secretKey: new Uint8Array(31), publicNonce, sessionKey })
+      ).toThrow(TypeError);
+    });
+
+    it('returns the same plain public key from a session as from its key gen context', function () {
+      const { publicKey } = newSigner();
+      const other = newSigner().publicKey;
+      const keys = [publicKey, other];
+      const sessionKey = musig.startSigningSession(new Uint8Array(66), randomBytes(), keys);
+      expect(hex(musig.getPlainPubkey(sessionKey))).toBe(
+        hex(musig.getPlainPubkey(musig.keyAgg(keys)))
+      );
     });
   });
 }
@@ -803,6 +1171,29 @@ describe('adversarial / safety properties', function () {
         sessionKey: session,
       })
     ).toBe(false);
+  });
+
+  it('refuses to partially sign for a key set the signer is not part of', function () {
+    const { a, na } = setup();
+    const outsiders = musig.keySort([newKey().pk, newKey().pk]);
+    const aggNonce = musig.nonceAgg([na.publicNonce, na.publicNonce]);
+    const session = musig.startSigningSession(aggNonce, nc.randomBytes(32), outsiders);
+    expect(() =>
+      musig.partialSign({ secretKey: a.sk, publicNonce: na.publicNonce, sessionKey: session })
+    ).toThrow(/must be included/);
+  });
+
+  it('refuses to sign deterministically for a key set the signer is not part of', function () {
+    const { a, nb } = setup();
+    const args = {
+      secretKey: a.sk,
+      aggOtherNonce: nb.publicNonce,
+      publicKeys: musig.keySort([newKey().pk, newKey().pk]),
+      msg: nc.randomBytes(32),
+      rand: nc.randomBytes(32),
+    };
+    expect(() => musig.deterministicSign({ ...args, verify: true })).toThrow(/must be included/);
+    expect(() => musig.deterministicNonceGen(args)).toThrow(/must be included/);
   });
 
   it('is rogue-key resistant: aggregate key applies coefficients (≠ naive point sum)', function () {
